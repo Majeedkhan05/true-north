@@ -1,0 +1,304 @@
+{
+  "name": "BrokerageAI - FLOW1 - Email Ingestion",
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataSuccessExecution": "none",
+    "saveDataErrorExecution": "all",
+    "saveManualExecutions": false,
+    "errorWorkflow": "={{ $env.N8N_WF_FAILURE_FLOW_ID }}",
+    "timezone": "America/Toronto"
+  },
+  "tags": ["brokerage-ai", "flow1", "ingestion"],
+  "nodes": [
+    {
+      "id": "imap",
+      "name": "IMAP Trigger",
+      "type": "n8n-nodes-base.emailReadImap",
+      "typeVersion": 2,
+      "position": [220, 360],
+      "parameters": {
+        "mailbox": "INBOX",
+        "format": "resolved",
+        "options": { "customEmailConfig": "[\"UNSEEN\"]", "downloadAttachments": true }
+      },
+      "credentials": { "imap": { "id": "IMAP_BROKERAGE", "name": "Brokerage IMAP" } }
+    },
+    {
+      "id": "validate",
+      "name": "Validate + SHA256 (no PII stored)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 360],
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "const crypto = require('crypto');\nconst MAX_BYTES = 10 * 1024 * 1024;          // 10 MB cap\nconst bin = $binary || {};\nconst keys = Object.keys(bin);\nconst pdfKey = keys.find(k => ((bin[k].mimeType||'').includes('pdf')) || (bin[k].fileName||'').toLowerCase().endsWith('.pdf'));\n// resolve tenant from intake+<brokerage_id>@domain ; sender PII is NOT persisted\nconst to = ($json.to || $json.headers?.to || '').toString();\nconst m = to.match(/intake\\+([a-f0-9-]+)@/i);\nconst brokerage_id = m ? m[1] : ($json.brokerage_id || '');\nlet valid = true, reason = '';\nif (!pdfKey) { valid = false; reason = 'NO_PDF'; }\nlet file_hash = null, size = 0;\nif (pdfKey) {\n  const buf = Buffer.from(bin[pdfKey].data, 'base64');\n  size = buf.length;\n  if (size > MAX_BYTES) { valid = false; reason = 'TOO_LARGE'; }\n  file_hash = crypto.createHash('sha256').update(buf).digest('hex');\n}\nif (!brokerage_id) { valid = false; reason = reason || 'NO_BROKERAGE'; }\nconst out = { brokerage_id, file_hash, size, valid, reason, sender: ($json.from||null) };\nreturn [{ json: out, binary: pdfKey ? { file: bin[pdfKey] } : {} }];"
+      }
+    },
+    {
+      "id": "if_valid",
+      "name": "IF Valid PDF",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [700, 360],
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true },
+          "combinator": "and",
+          "conditions": [
+            { "leftValue": "={{ $json.valid }}", "rightValue": true, "operator": { "type": "boolean", "operation": "true", "singleValue": true } }
+          ]
+        }
+      }
+    },
+    {
+      "id": "notify_invalid",
+      "name": "Notify Sender - PDF Only",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [940, 540],
+      "parameters": {
+        "fromEmail": "={{ $env.SYSTEM_FROM_EMAIL }}",
+        "toEmail": "={{ $json.sender }}",
+        "subject": "Please send a PDF only",
+        "emailFormat": "text",
+        "text": "We could not process your message. Please resend the insurance document as a single PDF attachment (max 10 MB)."
+      }
+    },
+    {
+      "id": "check_dup",
+      "name": "POST /check-duplicate",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [940, 240],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 60000,
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.FASTAPI_URL }}/check-duplicate",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [
+          { "name": "x-webhook-secret", "value": "={{ $env.WEBHOOK_SHARED_SECRET }}" }
+        ] },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ brokerage_id: $json.brokerage_id, file_hash: $json.file_hash }) }}",
+        "options": { "response": { "response": { "fullResponse": true, "neverError": true } }, "timeout": 30000 }
+      }
+    },
+    {
+      "id": "if_dup",
+      "name": "IF Duplicate",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1180, 240],
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true },
+          "combinator": "and",
+          "conditions": [
+            { "leftValue": "={{ $json.body.duplicate }}", "rightValue": true, "operator": { "type": "boolean", "operation": "true", "singleValue": true } }
+          ]
+        }
+      }
+    },
+    {
+      "id": "dup_log",
+      "name": "Audit: duplicate_skipped",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1420, 120],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.FASTAPI_URL }}/audit",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [ { "name": "x-webhook-secret", "value": "={{ $env.WEBHOOK_SHARED_SECRET }}" } ] },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ brokerage_id: $('Validate + SHA256 (no PII stored)').item.json.brokerage_id, document_id: $json.body.document_id, action: 'duplicate_skipped_n8n' }) }}",
+        "options": { "response": { "response": { "fullResponse": true, "neverError": true } } }
+      }
+    },
+    {
+      "id": "post_doc",
+      "name": "POST /webhook/document (upload+extract server-side)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1420, 320],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 60000,
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.FASTAPI_URL }}/webhook/document",
+        "contentType": "multipart-form-data",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [
+          { "name": "x-webhook-secret", "value": "={{ $env.WEBHOOK_SHARED_SECRET }}" },
+          { "name": "x-brokerage-id", "value": "={{ $('Validate + SHA256 (no PII stored)').item.json.brokerage_id }}" },
+          { "name": "Idempotency-Key", "value": "={{ $('Validate + SHA256 (no PII stored)').item.json.file_hash }}" }
+        ] },
+        "sendBody": true,
+        "bodyParameters": { "parameters": [
+          { "name": "brokerage_id", "value": "={{ $('Validate + SHA256 (no PII stored)').item.json.brokerage_id }}" },
+          { "parameterType": "formBinaryData", "name": "file", "inputDataFieldName": "file" }
+        ] },
+        "options": { "response": { "response": { "fullResponse": true, "neverError": true } }, "timeout": 120000 }
+      }
+    },
+    {
+      "id": "route",
+      "name": "Compute Route (confidence + status)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1660, 320],
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "const code = $json.statusCode;\nconst b = $json.body || {};\nconst conf = Number(b.confidence_score || 0);\nlet route = 'ERROR';\nif (code === 200) route = (conf >= 85) ? 'DRAFT' : 'REVIEW';\nelse if (code === 403) route = 'BILLING';\nelse if (code === 429) route = 'UPGRADE';\nelse if (code === 400) route = 'INVALID';\nelse if (code === 409) route = 'DUPLICATE';\nelse route = 'ERROR';\n// PII-free execution log\nconsole.log(JSON.stringify({ document_id: b.document_id || null, status: route, confidence: conf, code }));\nreturn [{ json: {\n  route, code, confidence: conf,\n  brokerage_id: $('Validate + SHA256 (no PII stored)').item.json.brokerage_id,\n  document_id: b.document_id || null,\n  language: b.language || 'en',\n  broker_email: b.broker_email || $env.BROKER_NOTIFY_EMAIL,\n  draft_email: b.draft_email || null,\n  upgrade_url: b.upgrade_url || $env.STRIPE_UPGRADE_URL,\n  billing_portal_url: b.billing_portal_url || $env.STRIPE_PORTAL_URL\n} }];"
+      }
+    },
+    {
+      "id": "switch",
+      "name": "Switch on Route",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [1900, 320],
+      "parameters": {
+        "rules": { "values": [
+          { "outputKey": "DRAFT", "conditions": { "options": { "caseSensitive": true }, "combinator": "and", "conditions": [ { "leftValue": "={{ $json.route }}", "rightValue": "DRAFT", "operator": { "type": "string", "operation": "equals" } } ] } },
+          { "outputKey": "REVIEW", "conditions": { "options": { "caseSensitive": true }, "combinator": "and", "conditions": [ { "leftValue": "={{ $json.route }}", "rightValue": "REVIEW", "operator": { "type": "string", "operation": "equals" } } ] } },
+          { "outputKey": "BILLING", "conditions": { "options": { "caseSensitive": true }, "combinator": "and", "conditions": [ { "leftValue": "={{ $json.route }}", "rightValue": "BILLING", "operator": { "type": "string", "operation": "equals" } } ] } },
+          { "outputKey": "UPGRADE", "conditions": { "options": { "caseSensitive": true }, "combinator": "and", "conditions": [ { "leftValue": "={{ $json.route }}", "rightValue": "UPGRADE", "operator": { "type": "string", "operation": "equals" } } ] } },
+          { "outputKey": "INVALID", "conditions": { "options": { "caseSensitive": true }, "combinator": "and", "conditions": [ { "leftValue": "={{ $json.route }}", "rightValue": "INVALID", "operator": { "type": "string", "operation": "equals" } } ] } },
+          { "outputKey": "DUPLICATE", "conditions": { "options": { "caseSensitive": true }, "combinator": "and", "conditions": [ { "leftValue": "={{ $json.route }}", "rightValue": "DUPLICATE", "operator": { "type": "string", "operation": "equals" } } ] } }
+        ] },
+        "options": { "fallbackOutput": "extra", "renameFallbackOutput": "ERROR" }
+      }
+    },
+    {
+      "id": "send_draft",
+      "name": "DRAFT >=85 - Draft to Broker",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [2160, 60],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 60000,
+      "parameters": {
+        "fromEmail": "={{ $env.SYSTEM_FROM_EMAIL }}",
+        "toEmail": "={{ $json.broker_email }}",
+        "subject": "={{ $json.language === 'fr' ? 'Document à réviser — brouillon prêt' : 'Document ready for review — draft prepared' }}",
+        "emailFormat": "text",
+        "text": "={{ $json.draft_email }}"
+      }
+    },
+    {
+      "id": "send_review",
+      "name": "REVIEW <85 - Review Required",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [2160, 200],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 60000,
+      "parameters": {
+        "fromEmail": "={{ $env.SYSTEM_FROM_EMAIL }}",
+        "toEmail": "={{ $json.broker_email }}",
+        "subject": "={{ $json.language === 'fr' ? 'RÉVISION REQUISE — faible confiance' : 'REVIEW REQUIRED — low confidence' }}",
+        "emailFormat": "text",
+        "text": "={{ ($json.language === 'fr' ? 'Confiance faible (' : 'Low extraction confidence (') + $json.confidence + ($json.language === 'fr' ? '/100). Révision manuelle requise dans le tableau de bord. Document : ' : '/100). Manual review required in the dashboard. Document: ') + $json.document_id }}"
+      }
+    },
+    {
+      "id": "send_billing",
+      "name": "BILLING 403 - Reminder",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [2160, 340],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 60000,
+      "parameters": {
+        "fromEmail": "={{ $env.SYSTEM_FROM_EMAIL }}",
+        "toEmail": "={{ $json.broker_email }}",
+        "subject": "={{ $json.language === 'fr' ? 'Abonnement inactif — réactivation requise' : 'Subscription inactive — reactivation required' }}",
+        "emailFormat": "text",
+        "text": "={{ ($json.language === 'fr' ? 'Le traitement est bloqué (abonnement inactif). Réactivez : ' : 'Processing is blocked (subscription inactive). Reactivate: ') + $json.billing_portal_url }}"
+      }
+    },
+    {
+      "id": "send_upgrade",
+      "name": "UPGRADE 429 - Upgrade Email",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [2160, 480],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 60000,
+      "parameters": {
+        "fromEmail": "={{ $env.SYSTEM_FROM_EMAIL }}",
+        "toEmail": "={{ $json.broker_email }}",
+        "subject": "={{ $json.language === 'fr' ? 'Quota atteint — mise à niveau' : 'Quota reached — upgrade' }}",
+        "emailFormat": "text",
+        "text": "={{ ($json.language === 'fr' ? 'Quota mensuel atteint. Mettez à niveau : ' : 'Monthly quota reached. Upgrade: ') + $json.upgrade_url }}"
+      }
+    },
+    {
+      "id": "invalid_noop",
+      "name": "INVALID 400 - Notify Sender",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [2160, 600],
+      "parameters": {
+        "fromEmail": "={{ $env.SYSTEM_FROM_EMAIL }}",
+        "toEmail": "={{ $env.BROKER_NOTIFY_EMAIL }}",
+        "subject": "Invalid document",
+        "emailFormat": "text",
+        "text": "={{ 'A document failed validation. Document: ' + $json.document_id }}"
+      }
+    },
+    {
+      "id": "dup_noop2",
+      "name": "DUPLICATE - Stop",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [2160, 720]
+    },
+    {
+      "id": "to_failure",
+      "name": "ERROR - Execute FLOW4",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1,
+      "position": [2160, 840],
+      "parameters": {
+        "source": "database",
+        "workflowId": "={{ $env.N8N_WF_FAILURE_FLOW_ID }}",
+        "fields": { "values": [
+          { "name": "brokerage_id", "stringValue": "={{ $json.brokerage_id }}" },
+          { "name": "document_id", "stringValue": "={{ $json.document_id }}" },
+          { "name": "context", "stringValue": "flow1_webhook_document" },
+          { "name": "attempt", "stringValue": "0" }
+        ] }
+      }
+    }
+  ],
+  "connections": {
+    "IMAP Trigger": { "main": [[{ "node": "Validate + SHA256 (no PII stored)", "type": "main", "index": 0 }]] },
+    "Validate + SHA256 (no PII stored)": { "main": [[{ "node": "IF Valid PDF", "type": "main", "index": 0 }]] },
+    "IF Valid PDF": { "main": [[{ "node": "POST /check-duplicate", "type": "main", "index": 0 }], [{ "node": "Notify Sender - PDF Only", "type": "main", "index": 0 }]] },
+    "POST /check-duplicate": { "main": [[{ "node": "IF Duplicate", "type": "main", "index": 0 }]] },
+    "IF Duplicate": { "main": [[{ "node": "Audit: duplicate_skipped", "type": "main", "index": 0 }], [{ "node": "POST /webhook/document (upload+extract server-side)", "type": "main", "index": 0 }]] },
+    "POST /webhook/document (upload+extract server-side)": { "main": [[{ "node": "Compute Route (confidence + status)", "type": "main", "index": 0 }]] },
+    "Compute Route (confidence + status)": { "main": [[{ "node": "Switch on Route", "type": "main", "index": 0 }]] },
+    "Switch on Route": { "main": [
+      [{ "node": "DRAFT >=85 - Draft to Broker", "type": "main", "index": 0 }],
+      [{ "node": "REVIEW <85 - Review Required", "type": "main", "index": 0 }],
+      [{ "node": "BILLING 403 - Reminder", "type": "main", "index": 0 }],
+      [{ "node": "UPGRADE 429 - Upgrade Email", "type": "main", "index": 0 }],
+      [{ "node": "INVALID 400 - Notify Sender", "type": "main", "index": 0 }],
+      [{ "node": "DUPLICATE - Stop", "type": "main", "index": 0 }],
+      [{ "node": "ERROR - Execute FLOW4", "type": "main", "index": 0 }]
+    ] }
+  }
+}

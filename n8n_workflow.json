@@ -1,0 +1,195 @@
+{
+  "name": "Brokerage-AI — Email Intake",
+  "nodes": [
+    {
+      "parameters": {
+        "mailbox": "INBOX",
+        "format": "resolved",
+        "options": { "customEmailConfig": "[\"UNSEEN\"]", "downloadAttachments": true }
+      },
+      "id": "imap-trigger",
+      "name": "IMAP Email Trigger",
+      "type": "n8n-nodes-base.emailReadImap",
+      "typeVersion": 2,
+      "position": [240, 300],
+      "credentials": { "imap": { "id": "1", "name": "Brokerage IMAP" } }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $binary ? Object.keys($binary).length : 0 }}",
+              "operation": "larger",
+              "value2": "0"
+            }
+          ]
+        }
+      },
+      "id": "has-pdf",
+      "name": "Has PDF Attachment?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [480, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Resolve brokerage_id from the recipient address (e.g. intake+<brokerage_id>@brokerage-ai.ca)\nconst to = ($json.to || $json.headers?.to || '').toString();\nconst m = to.match(/intake\\+([a-f0-9\\-]+)@/i);\nconst brokerageId = m ? m[1] : ($json.brokerage_id || '');\nreturn [{ json: { brokerage_id: brokerageId }, binary: $binary }];"
+      },
+      "id": "resolve-brokerage",
+      "name": "Resolve Brokerage ID",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [700, 240]
+    },
+    {
+      "parameters": {
+        "functionCode": "// SHA256 dedup guard before hitting the API (the API also dedups).\nconst crypto = require('crypto');\nconst key = Object.keys($binary)[0];\nconst buff = Buffer.from($binary[key].data, 'base64');\nconst hash = crypto.createHash('sha256').update(buff).digest('hex');\nreturn [{ json: { ...$json, file_hash: hash }, binary: $binary }];"
+      },
+      "id": "sha256",
+      "name": "SHA256 Hash",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [920, 240]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.API_BASE_URL}}/webhook/document",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "x-webhook-secret", "value": "={{$env.WEBHOOK_SHARED_SECRET}}" }
+          ]
+        },
+        "contentType": "multipart-form-data",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "brokerage_id", "value": "={{$json.brokerage_id}}" },
+            { "name": "file", "parameterType": "formBinaryData", "inputDataFieldName": "attachment_0" }
+          ]
+        },
+        "options": { "response": { "response": { "fullResponse": true, "neverError": true } } }
+      },
+      "id": "post-document",
+      "name": "POST /webhook/document",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1140, 240]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "rules": [
+            { "value2": 200, "output": 0 },
+            { "value2": 403, "output": 1 },
+            { "value2": 500, "output": 2 }
+          ]
+        },
+        "value1": "={{$json.statusCode}}",
+        "dataType": "number"
+      },
+      "id": "switch-status",
+      "name": "Switch on HTTP Status",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 1,
+      "position": [1380, 240]
+    },
+    {
+      "parameters": {
+        "fromEmail": "noreply@brokerage-ai.ca",
+        "toEmail": "={{$json.broker_email || $env.BROKER_NOTIFY_EMAIL}}",
+        "subject": "Draft for review — insurance document processed",
+        "text": "={{$json.body.draft_email}}"
+      },
+      "id": "send-draft",
+      "name": "Send Draft Email to Broker",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2,
+      "position": [1640, 120]
+    },
+    {
+      "parameters": {
+        "fromEmail": "noreply@brokerage-ai.ca",
+        "toEmail": "={{$env.BROKER_NOTIFY_EMAIL}}",
+        "subject": "Subscription inactive — document not processed",
+        "text": "A document could not be processed because the brokerage subscription is inactive. Please update billing in the Brokerage-AI portal."
+      },
+      "id": "send-inactive",
+      "name": "Notify Subscription Inactive",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2,
+      "position": [1640, 260]
+    },
+    {
+      "parameters": {
+        "amount": 30,
+        "unit": "seconds"
+      },
+      "id": "wait-retry",
+      "name": "Wait 30s",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1,
+      "position": [1620, 400]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.API_BASE_URL}}/webhook/document",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "x-webhook-secret", "value": "={{$env.WEBHOOK_SHARED_SECRET}}" }
+          ]
+        },
+        "contentType": "multipart-form-data",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "brokerage_id", "value": "={{$json.brokerage_id}}" },
+            { "name": "file", "parameterType": "formBinaryData", "inputDataFieldName": "attachment_0" }
+          ]
+        },
+        "options": { "response": { "response": { "fullResponse": true, "neverError": true } } }
+      },
+      "id": "retry-post",
+      "name": "Retry POST /webhook/document",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1820, 400]
+    },
+    {
+      "parameters": {
+        "fromEmail": "noreply@brokerage-ai.ca",
+        "toEmail": "={{$env.ADMIN_ALERT_EMAIL}}",
+        "subject": "[ALERT] Brokerage-AI document processing failed (500)",
+        "text": "A document failed to process after retry. Investigate the FastAPI service and logs."
+      },
+      "id": "alert-admin",
+      "name": "Alert Admin",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2,
+      "position": [2040, 400]
+    }
+  ],
+  "connections": {
+    "IMAP Email Trigger": { "main": [[{ "node": "Has PDF Attachment?", "type": "main", "index": 0 }]] },
+    "Has PDF Attachment?": { "main": [[{ "node": "Resolve Brokerage ID", "type": "main", "index": 0 }], []] },
+    "Resolve Brokerage ID": { "main": [[{ "node": "SHA256 Hash", "type": "main", "index": 0 }]] },
+    "SHA256 Hash": { "main": [[{ "node": "POST /webhook/document", "type": "main", "index": 0 }]] },
+    "POST /webhook/document": { "main": [[{ "node": "Switch on HTTP Status", "type": "main", "index": 0 }]] },
+    "Switch on HTTP Status": {
+      "main": [
+        [{ "node": "Send Draft Email to Broker", "type": "main", "index": 0 }],
+        [{ "node": "Notify Subscription Inactive", "type": "main", "index": 0 }],
+        [{ "node": "Wait 30s", "type": "main", "index": 0 }]
+      ]
+    },
+    "Wait 30s": { "main": [[{ "node": "Retry POST /webhook/document", "type": "main", "index": 0 }]] },
+    "Retry POST /webhook/document": { "main": [[{ "node": "Alert Admin", "type": "main", "index": 0 }]] }
+  },
+  "settings": { "executionOrder": "v1" },
+  "active": false,
+  "tags": ["brokerage-ai", "email-intake"]
+}

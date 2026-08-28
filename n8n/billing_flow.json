@@ -1,0 +1,149 @@
+{
+  "name": "BrokerageAI - FLOW3 - Billing Enforcement",
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataSuccessExecution": "none",
+    "saveDataErrorExecution": "all",
+    "errorWorkflow": "={{ $env.N8N_WF_FAILURE_FLOW_ID }}",
+    "timezone": "America/Toronto"
+  },
+  "tags": ["brokerage-ai", "flow3", "billing"],
+  "nodes": [
+    {
+      "id": "stripe_webhook",
+      "name": "Webhook: stripe",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [220, 320],
+      "webhookId": "stripe-events",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "stripe",
+        "responseMode": "responseNode",
+        "options": { "rawBody": true }
+      }
+    },
+    {
+      "id": "forward",
+      "name": "Forward raw -> FastAPI /stripe/webhook (verifies + updates DB)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [470, 320],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 60000,
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.FASTAPI_URL }}/stripe/webhook",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [
+          { "name": "Stripe-Signature", "value": "={{ $json.headers['stripe-signature'] }}" },
+          { "name": "Content-Type", "value": "application/json" }
+        ] },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ $json.body }}",
+        "options": { "response": { "response": { "fullResponse": true, "neverError": true } }, "timeout": 30000 }
+      }
+    },
+    {
+      "id": "ack",
+      "name": "200 ACK to Stripe",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [720, 320],
+      "parameters": { "respondWith": "text", "responseBody": "ok", "options": { "responseCode": 200 } }
+    },
+    {
+      "id": "classify",
+      "name": "Classify Event (no PII)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [720, 500],
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "let evt = {};\ntry { evt = typeof $('Webhook: stripe').item.json.body === 'string' ? JSON.parse($('Webhook: stripe').item.json.body) : $('Webhook: stripe').item.json.body; } catch (e) { evt = {}; }\nconst type = evt.type || 'unknown';\nconst map = { 'checkout.session.completed': 'ACTIVATE', 'invoice.payment_failed': 'SUSPEND', 'customer.subscription.deleted': 'BLOCK' };\nconst action = map[type] || 'IGNORE';\n// FastAPI already applied the state change; n8n only notifies. Pull non-PII echo from forward response.\nconst fb = $('Forward raw -> FastAPI /stripe/webhook (verifies + updates DB)').item.json.body || {};\nconsole.log(JSON.stringify({ document_id: null, status: 'billing_' + action, type }));\nreturn [{ json: { action, type, broker_email: fb.broker_email || $env.BROKER_NOTIFY_EMAIL, language: fb.language || 'en', billing_portal_url: fb.billing_portal_url || $env.STRIPE_PORTAL_URL } }];"
+      }
+    },
+    {
+      "id": "switch_evt",
+      "name": "Switch on Action",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [960, 500],
+      "parameters": {
+        "rules": { "values": [
+          { "outputKey": "ACTIVATE", "conditions": { "options": { "caseSensitive": true }, "combinator": "and", "conditions": [ { "leftValue": "={{ $json.action }}", "rightValue": "ACTIVATE", "operator": { "type": "string", "operation": "equals" } } ] } },
+          { "outputKey": "SUSPEND", "conditions": { "options": { "caseSensitive": true }, "combinator": "and", "conditions": [ { "leftValue": "={{ $json.action }}", "rightValue": "SUSPEND", "operator": { "type": "string", "operation": "equals" } } ] } },
+          { "outputKey": "BLOCK", "conditions": { "options": { "caseSensitive": true }, "combinator": "and", "conditions": [ { "leftValue": "={{ $json.action }}", "rightValue": "BLOCK", "operator": { "type": "string", "operation": "equals" } } ] } }
+        ] },
+        "options": { "fallbackOutput": "extra", "renameFallbackOutput": "IGNORE" }
+      }
+    },
+    {
+      "id": "notify_activate",
+      "name": "ACTIVATE - Welcome / Active",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [1220, 320],
+      "retryOnFail": true, "maxTries": 3, "waitBetweenTries": 60000,
+      "parameters": {
+        "fromEmail": "={{ $env.SYSTEM_FROM_EMAIL }}",
+        "toEmail": "={{ $json.broker_email }}",
+        "subject": "={{ $json.language === 'fr' ? 'Abonnement activé' : 'Subscription activated' }}",
+        "emailFormat": "text",
+        "text": "={{ $json.language === 'fr' ? 'Votre compte est actif. Le traitement des documents est activé.' : 'Your account is active. Document processing is enabled.' }}"
+      }
+    },
+    {
+      "id": "notify_suspend",
+      "name": "SUSPEND - Payment Failed",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [1220, 460],
+      "retryOnFail": true, "maxTries": 3, "waitBetweenTries": 60000,
+      "parameters": {
+        "fromEmail": "={{ $env.SYSTEM_FROM_EMAIL }}",
+        "toEmail": "={{ $json.broker_email }}",
+        "subject": "={{ $json.language === 'fr' ? 'Paiement échoué — accès suspendu' : 'Payment failed — access suspended' }}",
+        "emailFormat": "text",
+        "text": "={{ ($json.language === 'fr' ? 'Votre paiement a échoué et l\\'accès est suspendu. Mettez à jour le paiement : ' : 'Your payment failed and access is suspended. Update payment: ') + $json.billing_portal_url }}"
+      }
+    },
+    {
+      "id": "notify_block",
+      "name": "BLOCK - Subscription Canceled",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [1220, 600],
+      "retryOnFail": true, "maxTries": 3, "waitBetweenTries": 60000,
+      "parameters": {
+        "fromEmail": "={{ $env.SYSTEM_FROM_EMAIL }}",
+        "toEmail": "={{ $json.broker_email }}",
+        "subject": "={{ $json.language === 'fr' ? 'Abonnement annulé — traitement bloqué' : 'Subscription canceled — processing blocked' }}",
+        "emailFormat": "text",
+        "text": "={{ ($json.language === 'fr' ? 'Votre abonnement est annulé. Réactivez : ' : 'Your subscription is canceled. Reactivate: ') + $json.billing_portal_url }}"
+      }
+    },
+    {
+      "id": "ignore",
+      "name": "IGNORE - No-op",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [1220, 740]
+    }
+  ],
+  "connections": {
+    "Webhook: stripe": { "main": [[{ "node": "Forward raw -> FastAPI /stripe/webhook (verifies + updates DB)", "type": "main", "index": 0 }]] },
+    "Forward raw -> FastAPI /stripe/webhook (verifies + updates DB)": { "main": [[{ "node": "200 ACK to Stripe", "type": "main", "index": 0 }, { "node": "Classify Event (no PII)", "type": "main", "index": 0 }]] },
+    "Classify Event (no PII)": { "main": [[{ "node": "Switch on Action", "type": "main", "index": 0 }]] },
+    "Switch on Action": { "main": [
+      [{ "node": "ACTIVATE - Welcome / Active", "type": "main", "index": 0 }],
+      [{ "node": "SUSPEND - Payment Failed", "type": "main", "index": 0 }],
+      [{ "node": "BLOCK - Subscription Canceled", "type": "main", "index": 0 }],
+      [{ "node": "IGNORE - No-op", "type": "main", "index": 0 }]
+    ] }
+  }
+}

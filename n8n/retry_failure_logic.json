@@ -1,0 +1,30 @@
+{
+  "constants": { "max_retries": 2, "base_delay_seconds": 60, "strategy": "exponential_backoff" },
+  "expressions": {
+    "is_retryable": "={{ $json.statusCode === 500 }}",
+    "is_success": "={{ $json.statusCode >= 200 && $json.statusCode < 300 }}",
+    "next_attempt": "={{ ($json.attempt || 0) + 1 }}",
+    "retries_exhausted": "={{ (($json.attempt || 0) + 1) > 2 }}",
+    "backoff_delay_seconds": "={{ 60 * Math.pow(2, ($json.attempt || 0)) }}",
+    "delay_schedule": { "attempt_0": 60, "attempt_1": 120, "attempt_2_then": "alert_admin" },
+    "decision": "={{ ($json.statusCode >= 200 && $json.statusCode < 300) ? 'RESOLVED' : ((($json.attempt || 0) + 1) > 2 ? 'ALERT_ADMIN' : 'RETRY_AGAIN') }}",
+    "route_from_status": "={{ ({200:'SUCCESS',429:'QUOTA_EXCEEDED',403:'SUBSCRIPTION_INACTIVE',400:'INVALID_PDF',409:'DUPLICATE',500:'ERROR'})[$json.statusCode] || 'ERROR' }}",
+    "language_render": "={{ $json.language === 'fr' ? $json.fr_text : $json.en_text }}",
+    "safe_log": "={{ JSON.stringify({ document_id: $json.document_id || null, status: $json.route || $json.decision }) }}"
+  },
+  "wait_node": {
+    "type": "n8n-nodes-base.wait",
+    "resume": "timeInterval",
+    "amount_expression": "={{ $json.base_delay * Math.pow(2, $json.attempt) }}",
+    "unit": "seconds"
+  },
+  "loop_guard": {
+    "rule": "increment attempt on every retry; route to ALERT_ADMIN when attempt > max_retries",
+    "prevents": "infinite_retry_loop"
+  },
+  "pii_protection": {
+    "execution_logging": "document_id + status only",
+    "forbidden_in_logs": ["named_insured", "policy_number", "sender_name", "email_body", "address", "SIN", "phone"],
+    "settings": { "saveDataSuccessExecution": "none", "saveManualExecutions": false }
+  }
+}

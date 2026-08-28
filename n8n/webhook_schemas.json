@@ -1,0 +1,84 @@
+{
+  "_note": "FastAPI is the source of truth. All n8n->FastAPI calls send header x-webhook-secret. No PII is logged by n8n.",
+
+  "check_duplicate": {
+    "direction": "n8n -> FastAPI",
+    "method": "POST",
+    "path": "/check-duplicate",
+    "headers": { "x-webhook-secret": "string (required)" },
+    "request": { "brokerage_id": "uuid", "file_hash": "sha256 hex" },
+    "responses": {
+      "200": { "duplicate": "boolean", "document_id": "uuid|null" },
+      "401": { "detail": "Invalid webhook secret" }
+    }
+  },
+
+  "webhook_document": {
+    "direction": "n8n -> FastAPI",
+    "method": "POST",
+    "path": "/webhook/document",
+    "content_type": "multipart/form-data",
+    "headers": { "x-webhook-secret": "required", "x-brokerage-id": "uuid", "Idempotency-Key": "sha256" },
+    "request": { "brokerage_id": "uuid (form field)", "file": "PDF binary (form field)" },
+    "responses": {
+      "200": {
+        "status": "SUCCESS", "document_id": "uuid", "confidence_score": "0-100 (route >=85 DRAFT, <85 REVIEW)",
+        "draft_email": "string", "language": "en|fr", "broker_email": "string", "approval_token": "jwt", "extracted_json": "object"
+      },
+      "429": { "error": "QUOTA_EXCEEDED", "language": "en|fr", "broker_email": "string", "upgrade_url": "string" },
+      "403": { "error": "SUBSCRIPTION_INACTIVE", "language": "en|fr", "broker_email": "string", "billing_portal_url": "string" },
+      "400": { "error": "INVALID_PDF", "language": "en|fr", "broker_email": "string" },
+      "409": { "error": "DUPLICATE", "language": "en|fr", "document_id": "uuid" },
+      "500": { "error": "ERROR" }
+    }
+  },
+
+  "audit": {
+    "direction": "n8n -> FastAPI",
+    "method": "POST",
+    "path": "/audit",
+    "headers": { "x-webhook-secret": "required" },
+    "request": { "brokerage_id": "uuid|null", "document_id": "uuid|null", "action": "non-PII string", "ip_address": "string|null" },
+    "responses": { "200": { "logged": true }, "401": { "detail": "Invalid webhook secret" } }
+  },
+
+  "approval_complete": {
+    "direction": "FastAPI -> n8n (FLOW 2)",
+    "method": "POST",
+    "path": "/webhook/approval-complete",
+    "fired_by": "FastAPI after /brokerage/approve/{id} or /approve/{token}",
+    "headers": { "x-webhook-secret": "required" },
+    "request": {
+      "brokerage_id": "uuid", "document_id": "uuid", "language": "en|fr",
+      "broker_email": "string", "client_email": "string|null", "final_email": "approved email body"
+    },
+    "n8n_behavior": "client_email present -> send to client (CC broker); else -> send to broker to forward; then POST /audit",
+    "responses": { "200": { "ok": true, "document_id": "uuid" } }
+  },
+
+  "stripe": {
+    "direction": "Stripe -> n8n (FLOW 3) -> FastAPI",
+    "method": "POST",
+    "path": "/webhook/stripe",
+    "raw_body": true,
+    "n8n_behavior": "forward raw + Stripe-Signature to FastAPI /stripe/webhook (verifies + updates DB), ACK 200, then notify by event type",
+    "events": {
+      "checkout.session.completed": "ACTIVATE -> activate brokerage + welcome email",
+      "invoice.payment_failed": "SUSPEND -> suspend access + payment email",
+      "customer.subscription.deleted": "BLOCK -> block processing + canceled email"
+    }
+  },
+
+  "retry_process": {
+    "direction": "n8n FLOW 4 -> FastAPI",
+    "method": "POST",
+    "path": "/retry/process",
+    "headers": { "x-webhook-secret": "required", "x-brokerage-id": "uuid" },
+    "request": { "document_id": "uuid|null" },
+    "responses": {
+      "200": "ProcessResult (RESOLVED)",
+      "404": { "error": "DOCUMENT_NOT_FOUND" },
+      "400": { "error": "MAX_RETRIES_EXCEEDED", "document_id": "uuid", "retry_count": 2 }
+    }
+  }
+}

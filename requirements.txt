@@ -1,0 +1,37 @@
+# ---- Core API ----
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+pydantic[email]==2.10.4
+pydantic-settings==2.7.1
+email-validator==2.2.0
+python-dotenv==1.0.1
+
+# ---- Database (PostgreSQL / Supabase ca-central-1) ----
+SQLAlchemy==2.0.36
+psycopg2-binary==2.9.10
+
+# ---- Storage (Supabase) ----
+supabase==2.11.0
+
+# ---- AI ----
+google-generativeai==0.8.3
+
+# ---- OCR / PDF ----
+pdfplumber==0.11.4
+pytesseract==0.3.13
+pdf2image==1.17.0
+Pillow==11.0.0
+
+# ---- Auth (approval JWT) ----
+PyJWT==2.10.1
+
+# ---- Payments ----
+stripe==11.4.1
+
+# ---- Frontend ----
+streamlit==1.41.1
+
+# ---- HTTP ----
+requests==2.32.3
+httpx==0.28.1

@@ -1,0 +1,42 @@
+# Render.com blueprint — deploy the FastAPI backend with one click.
+# Dashboard → New → Blueprint → point at this repo.
+services:
+  - type: web
+    name: truenorth-api
+    runtime: docker
+    rootDir: brokerage-ai
+    plan: starter
+    healthCheckPath: /healthz
+    envVars:
+      - key: DEMO_MODE
+        value: "false"
+      - key: DATABASE_URL
+        sync: false   # postgresql://postgres:<PASSWORD>@db.bnsmiwvlspfxhjchlkcr.supabase.co:5432/postgres
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: STRIPE_PRICE_STARTER
+        sync: false
+      - key: STRIPE_PRICE_PRO
+        sync: false
+      - key: STRIPE_PRICE_ENTERPRISE
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: WEBHOOK_SHARED_SECRET
+        generateValue: true
+      - key: SUPABASE_URL
+        value: https://bnsmiwvlspfxhjchlkcr.supabase.co
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: ADMIN_API_KEY
+        generateValue: true
+      - key: CORS_ORIGINS
+        value: https://app.yourdomain.ca
+      - key: RATE_LIMIT_PER_MIN
+        value: "120"
+      - key: MAX_UPLOAD_MB
+        value: "10"

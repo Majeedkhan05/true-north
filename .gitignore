@@ -1,0 +1,29 @@
+# --- secrets: never commit ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+service-account*.json
+
+# --- local state / transient databases ---
+brokerage.db
+test_local.db
+*.sqlite
+*.sqlite3
+local_storage/
+
+# --- python ---
+.venv/
+venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+
+# --- os / editor ---
+.DS_Store
+*.swp
+.idea/
+.vscode/

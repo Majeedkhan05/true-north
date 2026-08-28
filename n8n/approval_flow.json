@@ -1,0 +1,126 @@
+{
+  "name": "BrokerageAI - FLOW2 - Approval Pipeline",
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataSuccessExecution": "none",
+    "saveDataErrorExecution": "all",
+    "errorWorkflow": "={{ $env.N8N_WF_FAILURE_FLOW_ID }}",
+    "timezone": "America/Toronto"
+  },
+  "tags": ["brokerage-ai", "flow2", "approval"],
+  "nodes": [
+    {
+      "id": "approval_webhook",
+      "name": "Webhook: approval-complete",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [220, 320],
+      "webhookId": "approval-complete",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "approval-complete",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "auth",
+      "name": "Verify Secret + Extract (no PII log)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 320],
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "const b = $json.body || {};\nconst secret = $json.headers ? $json.headers['x-webhook-secret'] : null;\nif ($env.WEBHOOK_SHARED_SECRET && secret !== $env.WEBHOOK_SHARED_SECRET) {\n  throw new Error('UNAUTHORIZED');   // -> errorWorkflow (no PII)\n}\nconsole.log(JSON.stringify({ document_id: b.document_id || null, status: 'approval_received' }));\nreturn [{ json: {\n  brokerage_id: b.brokerage_id,\n  document_id: b.document_id,\n  language: b.language || 'en',\n  broker_email: b.broker_email || $env.BROKER_NOTIFY_EMAIL,\n  client_email: b.client_email || null,\n  final_email: b.final_email || ''\n} }];"
+      }
+    },
+    {
+      "id": "if_client",
+      "name": "IF client_email present",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [700, 320],
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true },
+          "combinator": "and",
+          "conditions": [
+            { "leftValue": "={{ $json.client_email }}", "rightValue": "", "operator": { "type": "string", "operation": "notEmpty", "singleValue": true } }
+          ]
+        }
+      }
+    },
+    {
+      "id": "send_client",
+      "name": "Send Final Email to Client (broker CC)",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [940, 220],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 60000,
+      "parameters": {
+        "fromEmail": "={{ $env.SYSTEM_FROM_EMAIL }}",
+        "toEmail": "={{ $json.client_email }}",
+        "ccEmail": "={{ $json.broker_email }}",
+        "subject": "={{ $json.language === 'fr' ? 'Votre document d\\'assurance' : 'Your insurance document' }}",
+        "emailFormat": "text",
+        "text": "={{ $json.final_email }}"
+      }
+    },
+    {
+      "id": "send_broker_forward",
+      "name": "Send to Broker to Forward",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [940, 420],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 60000,
+      "parameters": {
+        "fromEmail": "={{ $env.SYSTEM_FROM_EMAIL }}",
+        "toEmail": "={{ $json.broker_email }}",
+        "subject": "={{ $json.language === 'fr' ? 'Approuvé — à transmettre au client' : 'Approved — forward to client' }}",
+        "emailFormat": "text",
+        "text": "={{ ($json.language === 'fr' ? 'Aucun courriel client au dossier. Veuillez transmettre :\\n\\n' : 'No client email on file. Please forward:\\n\\n') + $json.final_email }}"
+      }
+    },
+    {
+      "id": "audit",
+      "name": "Audit: final_email_sent",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1200, 320],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 60000,
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.FASTAPI_URL }}/audit",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [ { "name": "x-webhook-secret", "value": "={{ $env.WEBHOOK_SHARED_SECRET }}" } ] },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ brokerage_id: $json.brokerage_id, document_id: $json.document_id, action: 'final_email_sent' }) }}",
+        "options": { "response": { "response": { "fullResponse": true, "neverError": true } } }
+      }
+    },
+    {
+      "id": "respond",
+      "name": "200 OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1440, 320],
+      "parameters": { "respondWith": "json", "responseBody": "={{ JSON.stringify({ ok: true, document_id: $json.document_id }) }}", "options": { "responseCode": 200 } }
+    }
+  ],
+  "connections": {
+    "Webhook: approval-complete": { "main": [[{ "node": "Verify Secret + Extract (no PII log)", "type": "main", "index": 0 }]] },
+    "Verify Secret + Extract (no PII log)": { "main": [[{ "node": "IF client_email present", "type": "main", "index": 0 }]] },
+    "IF client_email present": { "main": [[{ "node": "Send Final Email to Client (broker CC)", "type": "main", "index": 0 }], [{ "node": "Send to Broker to Forward", "type": "main", "index": 0 }]] },
+    "Send Final Email to Client (broker CC)": { "main": [[{ "node": "Audit: final_email_sent", "type": "main", "index": 0 }]] },
+    "Send to Broker to Forward": { "main": [[{ "node": "Audit: final_email_sent", "type": "main", "index": 0 }]] },
+    "Audit: final_email_sent": { "main": [[{ "node": "200 OK", "type": "main", "index": 0 }]] }
+  }
+}

@@ -1,0 +1,50 @@
+{
+  "source_of_truth": "FastAPI",
+  "n8n_role": "orchestration_only",
+  "global_rules": {
+    "max_retries": 2,
+    "retry_delay_seconds": 60,
+    "backoff": "exponential (60 * 2^attempt)",
+    "headers_required": ["x-webhook-secret", "x-brokerage-id"],
+    "pii_in_execution_data": false,
+    "log_fields_allowed": ["document_id", "status", "confidence"],
+    "save_data_success_execution": "none",
+    "error_workflow": "FLOW4 (failure_flow) on every workflow",
+    "never_bypass_fastapi": true,
+    "single_uploader": "FastAPI /webhook/document (n8n does not double-write to Supabase)"
+  },
+
+  "flow1_email_ingestion": [
+    { "stage": "validate",        "rule": "PDF only, <= 10MB, brokerage_id resolvable", "fail": "Notify Sender - PDF Only" },
+    { "stage": "check_duplicate", "endpoint": "/check-duplicate", "on_true": "Audit duplicate_skipped + stop" },
+    { "stage": "process",         "endpoint": "/webhook/document", "retry": "3x/60s" },
+    { "status_code": 200, "confidence_gte_85": "DRAFT -> send draft to broker",
+                          "confidence_lt_85": "REVIEW -> review-required notification only" },
+    { "status_code": 403, "route": "BILLING -> billing reminder (billing_portal_url)" },
+    { "status_code": 429, "route": "UPGRADE -> upgrade email (upgrade_url)" },
+    { "status_code": 400, "route": "INVALID -> notify" },
+    { "status_code": 409, "route": "DUPLICATE -> stop silently" },
+    { "status_code": 500, "route": "ERROR -> Execute FLOW4 (retry then admin alert)" }
+  ],
+
+  "flow2_approval": {
+    "trigger": "POST /webhook/approval-complete (fired by FastAPI after approval)",
+    "client_email_present": "send final email to client (CC broker)",
+    "client_email_null": "send to broker to forward",
+    "then": "POST /audit final_email_sent"
+  },
+
+  "flow3_billing": {
+    "trigger": "POST /webhook/stripe -> forward to FastAPI /stripe/webhook (authoritative)",
+    "checkout.session.completed": "ACTIVATE",
+    "invoice.payment_failed": "SUSPEND",
+    "customer.subscription.deleted": "BLOCK",
+    "other": "IGNORE"
+  },
+
+  "flow4_failure": {
+    "global_error_trigger": "PII-safe admin alert + /audit ('Processing failed for brokerage_id X')",
+    "explicit_retry": "Wait(exp backoff) -> /retry/process -> RESOLVED | RETRY_AGAIN | ALERT_ADMIN",
+    "max_retries": 2
+  }
+}

@@ -1,0 +1,184 @@
+{
+  "name": "BrokerageAI - FLOW4 - Failure Handling",
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataSuccessExecution": "none",
+    "saveDataErrorExecution": "all",
+    "saveExecutionProgress": true,
+    "timezone": "America/Toronto"
+  },
+  "tags": ["brokerage-ai", "flow4", "failure"],
+  "nodes": [
+    {
+      "id": "error_trigger",
+      "name": "Error Trigger (global)",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [220, 180],
+      "parameters": {}
+    },
+    {
+      "id": "safe_msg",
+      "name": "Build PII-safe Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 180],
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "// NEVER expose PII. Only workflow/node names + brokerage_id (an opaque uuid).\nconst wf = $json.workflow?.name || 'unknown_workflow';\nconst node = $json.execution?.lastNodeExecuted || 'unknown_node';\n// best-effort brokerage_id from the failed node's input (not PII)\nlet bid = 'unknown';\ntry { bid = $json.execution?.data?.resultData?.runData ? 'see_execution' : 'unknown'; } catch (e) {}\nif ($json.brokerage_id) bid = $json.brokerage_id;\nconst msg = `Processing failed for brokerage_id ${bid}`;\nconsole.log(JSON.stringify({ document_id: null, status: 'pipeline_error', workflow: wf, node }));\nreturn [{ json: { brokerage_id: bid, workflow: wf, node, message: msg } }];"
+      }
+    },
+    {
+      "id": "alert_err",
+      "name": "Admin Alert (error)",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [720, 180],
+      "retryOnFail": true, "maxTries": 3, "waitBetweenTries": 60000,
+      "parameters": {
+        "fromEmail": "={{ $env.SYSTEM_FROM_EMAIL }}",
+        "toEmail": "={{ $env.ADMIN_ALERT_EMAIL }}",
+        "subject": "[ALERT] BrokerageAI pipeline error",
+        "emailFormat": "text",
+        "text": "={{ $json.message + '\\nWorkflow: ' + $json.workflow + '\\nNode: ' + $json.node }}"
+      }
+    },
+    {
+      "id": "audit_err",
+      "name": "Audit (error)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [980, 180],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.FASTAPI_URL }}/audit",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [ { "name": "x-webhook-secret", "value": "={{ $env.WEBHOOK_SHARED_SECRET }}" } ] },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ brokerage_id: ($json.brokerage_id === 'unknown' ? null : $json.brokerage_id), action: 'pipeline_error_' + $json.node }) }}",
+        "options": { "response": { "response": { "fullResponse": true, "neverError": true } } }
+      }
+    },
+
+    {
+      "id": "exec_trigger",
+      "name": "Execute Workflow Trigger (retry)",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1,
+      "position": [220, 480],
+      "parameters": {}
+    },
+    {
+      "id": "init",
+      "name": "Init Attempt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [440, 480],
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "const i = $json;\nreturn [{ json: { brokerage_id: i.brokerage_id, document_id: i.document_id || null, context: i.context || 'unknown', attempt: Number(i.attempt || 0), max_retries: 2, base_delay: 60 } }];"
+      }
+    },
+    {
+      "id": "wait",
+      "name": "Wait (exp backoff)",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [660, 480],
+      "parameters": { "resume": "timeInterval", "amount": "={{ $json.base_delay * Math.pow(2, $json.attempt) }}", "unit": "seconds" }
+    },
+    {
+      "id": "retry_call",
+      "name": "POST /retry/process",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [880, 480],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.FASTAPI_URL }}/retry/process",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [
+          { "name": "x-webhook-secret", "value": "={{ $env.WEBHOOK_SHARED_SECRET }}" },
+          { "name": "x-brokerage-id", "value": "={{ $json.brokerage_id }}" }
+        ] },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ document_id: $json.document_id }) }}",
+        "options": { "response": { "response": { "fullResponse": true, "neverError": true } }, "timeout": 120000 }
+      }
+    },
+    {
+      "id": "eval",
+      "name": "Evaluate Retry",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1100, 480],
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "const prev = $('Init Attempt').item.json;\nconst code = $json.statusCode;\nconst ok = code >= 200 && code < 300;\nconst attempt = prev.attempt + 1;\nconst exhausted = attempt > prev.max_retries;\nconst decision = ok ? 'RESOLVED' : (exhausted ? 'ALERT_ADMIN' : 'RETRY_AGAIN');\nconsole.log(JSON.stringify({ document_id: prev.document_id, status: 'retry_' + decision, attempt }));\nreturn [{ json: { ...prev, attempt, status_code: code, decision } }];"
+      }
+    },
+    {
+      "id": "switch_dec",
+      "name": "Switch Decision",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [1320, 480],
+      "parameters": {
+        "rules": { "values": [
+          { "outputKey": "RESOLVED", "conditions": { "options": { "caseSensitive": true }, "combinator": "and", "conditions": [ { "leftValue": "={{ $json.decision }}", "rightValue": "RESOLVED", "operator": { "type": "string", "operation": "equals" } } ] } },
+          { "outputKey": "RETRY_AGAIN", "conditions": { "options": { "caseSensitive": true }, "combinator": "and", "conditions": [ { "leftValue": "={{ $json.decision }}", "rightValue": "RETRY_AGAIN", "operator": { "type": "string", "operation": "equals" } } ] } },
+          { "outputKey": "ALERT_ADMIN", "conditions": { "options": { "caseSensitive": true }, "combinator": "and", "conditions": [ { "leftValue": "={{ $json.decision }}", "rightValue": "ALERT_ADMIN", "operator": { "type": "string", "operation": "equals" } } ] } }
+        ] }
+      }
+    },
+    {
+      "id": "resolved",
+      "name": "Resolved",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [1560, 320]
+    },
+    {
+      "id": "loop",
+      "name": "Loop Back",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [1560, 480]
+    },
+    {
+      "id": "alert_retry",
+      "name": "Admin Alert (retry exhausted)",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [1560, 640],
+      "retryOnFail": true, "maxTries": 3, "waitBetweenTries": 60000,
+      "parameters": {
+        "fromEmail": "={{ $env.SYSTEM_FROM_EMAIL }}",
+        "toEmail": "={{ $env.ADMIN_ALERT_EMAIL }}",
+        "subject": "[ALERT] BrokerageAI processing failed after 2 retries",
+        "emailFormat": "text",
+        "text": "={{ 'Processing failed for brokerage_id ' + $json.brokerage_id + ' (context: ' + $json.context + ', last_status: ' + $json.status_code + ')' }}"
+      }
+    }
+  ],
+  "connections": {
+    "Error Trigger (global)": { "main": [[{ "node": "Build PII-safe Message", "type": "main", "index": 0 }]] },
+    "Build PII-safe Message": { "main": [[{ "node": "Admin Alert (error)", "type": "main", "index": 0 }]] },
+    "Admin Alert (error)": { "main": [[{ "node": "Audit (error)", "type": "main", "index": 0 }]] },
+
+    "Execute Workflow Trigger (retry)": { "main": [[{ "node": "Init Attempt", "type": "main", "index": 0 }]] },
+    "Init Attempt": { "main": [[{ "node": "Wait (exp backoff)", "type": "main", "index": 0 }]] },
+    "Wait (exp backoff)": { "main": [[{ "node": "POST /retry/process", "type": "main", "index": 0 }]] },
+    "POST /retry/process": { "main": [[{ "node": "Evaluate Retry", "type": "main", "index": 0 }]] },
+    "Evaluate Retry": { "main": [[{ "node": "Switch Decision", "type": "main", "index": 0 }]] },
+    "Switch Decision": { "main": [
+      [{ "node": "Resolved", "type": "main", "index": 0 }],
+      [{ "node": "Loop Back", "type": "main", "index": 0 }],
+      [{ "node": "Admin Alert (retry exhausted)", "type": "main", "index": 0 }]
+    ] },
+    "Loop Back": { "main": [[{ "node": "Wait (exp backoff)", "type": "main", "index": 0 }]] }
+  }
+}
